@@ -1,0 +1,208 @@
+name: Build ShaanOS Packages Github
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [x86_64, x86]
+      max-parallel: 1  # Sırayla çalıştır
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build packages for ${{ matrix.arch }}
+        env:
+          RSA_PRIVATE_KEY: ${{ secrets.RSA_PRIVATE_KEY }}
+          RSA_PUBLIC_KEY: ${{ secrets.RSA_PUBLIC_KEY }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          # Alpine imaj belirle
+          if [ "${{ matrix.arch }}" = "x86" ]; then
+            ALPINE_IMAGE="i386/alpine:edge"
+          else
+            ALPINE_IMAGE="alpine:edge"
+          fi
+          
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            -e RSA_PRIVATE_KEY="$RSA_PRIVATE_KEY" \
+            -e RSA_PUBLIC_KEY="$RSA_PUBLIC_KEY" \
+            -e TARGET_ARCH="$TARGET_ARCH" \
+            "$ALPINE_IMAGE" sh -c '
+            set -e
+            
+            echo "=== 🔧 Ortam hazırlanıyor ($TARGET_ARCH) ==="
+            apk add --no-cache alpine-sdk shadow sudo git
+            
+            # Builder kullanıcı ve grubu
+            adduser -D builder
+            addgroup builder abuild
+            echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+            
+            # RSA anahtarları
+            mkdir -p /home/builder/.abuild
+            echo "$RSA_PRIVATE_KEY" > /home/builder/.abuild/shaanos-key.rsa
+            echo "$RSA_PUBLIC_KEY" > /home/builder/.abuild/shaanos-key.rsa.pub
+            cp /home/builder/.abuild/shaanos-key.rsa.pub /etc/apk/keys/
+            chown -R builder:builder /home/builder/.abuild
+            chmod 600 /home/builder/.abuild/shaanos-key.rsa
+            
+            # abuild.conf ayarları
+            echo "PACKAGER=\"Şahan Yılmaz <sahanyilmaz1@outlook.com>\"" > /home/builder/.abuild/abuild.conf
+            echo "PACKAGER_PRIVKEY=\"/home/builder/.abuild/shaanos-key.rsa\"" >> /home/builder/.abuild/abuild.conf
+            echo "CARCH=\"$TARGET_ARCH\"" >> /home/builder/.abuild/abuild.conf
+            
+            # Packages dizinini kontrol et ve sahipliğini ayarla
+            if [ ! -d "/workspace/packages" ]; then
+                echo "❌ HATA: /workspace/packages dizini bulunamadı!"
+                echo "📂 Workspace içeriği:"
+                ls -la /workspace/
+                exit 1
+            fi
+            
+            echo "📂 Packages dizini içeriği:"
+            ls -la /workspace/packages/
+            
+            chown -R builder:builder /workspace/packages
+            
+            # Public dizinini temizle ve hazırla
+            echo "=== 🧹 Eski dosyalar siliniyor ($TARGET_ARCH) ==="
+            mkdir -p /workspace/public/core/$TARGET_ARCH
+            rm -rf /workspace/public/core/$TARGET_ARCH/* || true
+            
+            # Paket dizinine geç
+            echo "=== 📦 ShaanOS paketleri derleniyor ($TARGET_ARCH) ==="
+            cd /workspace/packages/ || { 
+                echo "❌ Hedef dizine girilemedi!"
+                ls -la /workspace/
+                exit 1
+            }
+            
+            # Paket listeleri
+            SHAAN_PAKETLERI="shaan-baselayout shaan-base shaan-setup shaan-wbdev"
+            ALPINE_PAKETLERI="alpine-keys openrc busybox alpine-conf apk-tools musl linux-pam"
+            
+            # ShaanOS özel paketleri derle
+            echo "=== 🎯 ShaanOS özel paketleri ($TARGET_ARCH) ==="
+            for paket in $SHAAN_PAKETLERI; do
+                if [ -d "$paket" ]; then
+                    echo ">>> $paket derleniyor..."
+                    cd "$paket"
+                    if sudo -u builder sh -c "CARCH=$TARGET_ARCH abuild checksum && CARCH=$TARGET_ARCH abuild -r"; then
+                        echo "✅ $paket başarıyla derlendi"
+                    else
+                        echo "⚠️ $paket derleme başarısız!"
+                    fi
+                    cd ..
+                else
+                    echo "⚠️ $paket dizini yok, atlanıyor."
+                fi
+            done
+            
+            # Alpine tabanlı paketleri derle
+            echo "=== 🧩 Alpine tabanlı paketler ($TARGET_ARCH) ==="
+            for paket in $ALPINE_PAKETLERI; do
+                if [ -d "$paket" ]; then
+                    echo ">>> $paket derleniyor..."
+                    cd "$paket"
+                    if sudo -u builder sh -c "CARCH=$TARGET_ARCH abuild checksum && CARCH=$TARGET_ARCH abuild -r"; then
+                        echo "✅ $paket başarıyla derlendi"
+                    else
+                        echo "⚠️ $paket derleme başarısız!"
+                    fi
+                    cd ..
+                else
+                    echo "⚠️ $paket dizini yok, atlanıyor."
+                fi
+            done
+            
+            # Derlenen dosyaları kopyala
+            echo "=== 📁 Derlenen dosyalar kopyalanıyor ($TARGET_ARCH) ==="
+            mkdir -p /workspace/public/core/$TARGET_ARCH
+            
+            echo "🔍 Builder packages dizini içeriği:"
+            if [ -d "/home/builder/packages" ]; then
+                find /home/builder/packages -type f -name "*.apk" -o -name "*.tar.gz" | head -20
+            else
+                echo "⚠️ /home/builder/packages dizini bulunamadı"
+            fi
+            
+            # APK dosyalarını kopyala
+            APK_COUNT=0
+            if [ -d "/home/builder/packages" ]; then
+                for apk in $(find /home/builder/packages -name "*.apk"); do
+                    cp -v "$apk" /workspace/public/core/$TARGET_ARCH/
+                    APK_COUNT=$((APK_COUNT + 1))
+                done
+            fi
+            
+            # APKINDEX ve diğer dosyaları kopyala
+            find /home/builder/packages -name "APKINDEX.tar.gz" -exec cp -v {} /workspace/public/core/$TARGET_ARCH/ \; 2>/dev/null || true
+            
+            # Public key kopyala
+            cp /home/builder/.abuild/shaanos-key.rsa.pub /workspace/public/core/ 2>/dev/null || true
+            
+            # Dosya sahipliğini düzelt
+            chown -R 1001:121 /workspace/public 2>/dev/null || chown -R $(stat -c %u /workspace):$(stat -c %g /workspace) /workspace/public
+            
+            echo "=== ✅ Derleme tamamlandı ($TARGET_ARCH) ==="
+            echo "📊 Toplam $APK_COUNT paket derlendi"
+            echo "📂 Public dizini içeriği:"
+            ls -lh /workspace/public/core/$TARGET_ARCH/ || echo "⚠️ Dizin boş veya bulunamadı"
+          '
+
+      - name: Fix permissions
+        run: |
+          sudo chown -R $USER:$USER .
+
+      - name: Commit and push packages
+        run: |
+          git config user.name "shaanvision"
+          git config user.email "shaanvision@users.noreply.github.com"
+          
+          echo "=== 🔁 Commit işlemi başlatılıyor (${{ matrix.arch }}) ==="
+          git add public/
+          
+          if git diff --staged --quiet; then
+            echo "⚠️ Değişiklik yok, commit atlanıyor"
+            echo "📂 Public dizini durumu:"
+            ls -la public/core/${{ matrix.arch }}/ 2>/dev/null || echo "Dizin bulunamadı"
+          else
+            # Önce remote'daki değişiklikleri al
+            git fetch origin main
+            
+            # Conflict varsa stash kullan
+            if ! git diff-index --quiet HEAD --; then
+              git stash
+              git pull --rebase origin main || git pull origin main
+              git stash pop || true
+            else
+              git pull --rebase origin main || git pull origin main
+            fi
+            
+            # Tekrar add (stash pop sonrası)
+            git add public/
+            
+            PACKAGE_COUNT=$(find public/core/${{ matrix.arch }} -name "*.apk" 2>/dev/null | wc -l)
+            git commit -m "Rebuild ShaanOS packages (${{ matrix.arch }}): $PACKAGE_COUNT APK derlendi [$(date +'%Y-%m-%d %H:%M:%S')]"
+            
+            echo "=== 🚀 Değişiklikler push ediliyor ==="
+            git push origin main
+            
+            echo "✅ Paketler başarıyla public/core/${{ matrix.arch }}/ dizinine yüklendi!"
+          fi
