@@ -23,7 +23,6 @@ jobs:
         with:
           submodules: true         # Submodule’leri de klonla
           fetch-depth: 0           # Geçmişi tam indir
-          token: ${{ secrets.GH_TOKEN }}  # Eğer private repo ise PAT kullan
 
       - name: Show submodule status
         run: |
