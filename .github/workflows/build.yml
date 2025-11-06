@@ -21,6 +21,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
+	  submodules: true         # Submodule’leri de klonla
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
